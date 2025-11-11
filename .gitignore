@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.eggs/
+build/
+dist/
+
+# Virtual envs
+venv/
+.venv/
+env/
+ENV/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Logs and runtime
+*.log
+nohup.out
+*.pid
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints, large binaries
+*.ckpt
+*.pt
+*.pth
+*.bin
+model_weights/
+checkpoints/
+models/
+data/
+datasets/
+*.tar.gz
+*.zip
+
+# Secrets and credentials
+.env
+.env.* 
+*.key
+*.pem
+id_rsa*
+.credentials
+.git-credentials
+aws_credentials
+aws_secret_access_key
+.gcloud/
+.google_credentials/
+
+# Hugging Face / cache
+.huggingface/
+.cache/
+cache/
+transformers_cache/
+hf_data/
+*.cache
+
+# Docker / system
+docker-compose.override.yml
+.docker/
+*.local
+
+# Systemd service file if kept in repo accidentally
+*.service

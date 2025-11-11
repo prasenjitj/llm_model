@@ -192,7 +192,9 @@ async def generate_response(
         REQUEST_COUNT.labels(method="POST", endpoint="/generate", status="error").inc()
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
     finally:
-        REQUEST_LATENCY.labels(method="POST", endpoint="/generate").observe(time.time() - start_time)
+        elapsed_time = time.time() - start_time
+        logger.info(f"Request processed in {elapsed_time:.2f} seconds")
+        REQUEST_LATENCY.labels(method="POST", endpoint="/generate").observe(elapsed_time)
 
 if __name__ == "__main__":
     import uvicorn

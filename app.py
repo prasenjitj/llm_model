@@ -14,15 +14,44 @@ from PIL import Image
 import io
 import requests
 from typing import Optional
+from datetime import datetime, timezone, timedelta
+from colorama import Fore, Style, init
+
+# Define IST timezone
+IST = timezone(timedelta(hours=5, minutes=30))
+init(autoreset=True)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+class ISTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc).astimezone(IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        else:
+            return dt.isoformat()
+
+    def format(self, record):
+        level_colors = {
+            'DEBUG': Fore.CYAN,
+            'INFO': Fore.GREEN,
+            'WARNING': Fore.YELLOW,
+            'ERROR': Fore.RED,
+            'CRITICAL': Fore.MAGENTA
+        }
+        color = level_colors.get(record.levelname, Fore.WHITE)
+        record.levelname = f"{color}{record.levelname}{Style.RESET_ALL}"
+        return super().format(record)
+
+formatter = ISTFormatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S IST')
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
 logger = logging.getLogger(__name__)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # Load configuration from environment variables
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-VL-3B-Instruct")
 MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", 10 * 1024 * 1024))  # 10MB
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))  # seconds
 
 app = FastAPI(title="Qwen VL API", version="1.0.0")
 
@@ -69,11 +98,13 @@ async def generate_response(
     start_time = time.time()
     
     try:
-        logger.info(f"Processing request: text={text[:50]}..., image={image is not None}, url={image_url}")
+        logger.info(f"Processing request: text={text[:50]}..., image={image is not None}, image_url={image_url is not None}")
         
         # Validate inputs
         if not text.strip():
             raise HTTPException(status_code=400, detail="Text input is required")
+        if image and image_url:
+            raise HTTPException(status_code=400, detail="Provide either image file or URL, not both")
         if image and image.filename:
             if not image.content_type.startswith("image/"):
                 raise HTTPException(status_code=400, detail="Invalid image file type")
@@ -92,17 +123,21 @@ async def generate_response(
             image_data = await image.read()
             img = Image.open(io.BytesIO(image_data))
             logger.info(f"Image loaded from upload: {img.size}")
+
         elif image_url:
-            logger.info("Downloading image from URL")
-            # Download image from URL
+            logger.info(f"Fetching image from URL: {image_url}")
             try:
-                response = requests.get(image_url, timeout=REQUEST_TIMEOUT)
+                response = requests.get(image_url, timeout=10)
                 response.raise_for_status()
-                img = Image.open(io.BytesIO(response.content))
-                logger.info(f"Image downloaded from URL: {img.size}")
+                if not response.headers.get('content-type', '').startswith('image/'):
+                    raise HTTPException(status_code=400, detail="Invalid image URL")
+                image_data = response.content
+                if len(image_data) > MAX_IMAGE_SIZE:
+                    raise HTTPException(status_code=413, detail="Image too large")
+                img = Image.open(io.BytesIO(image_data))
+                logger.info(f"Image loaded from URL: {img.size}")
             except requests.RequestException as e:
-                logger.error(f"Failed to download image: {e}")
-                raise HTTPException(status_code=400, detail="Invalid image URL")
+                raise HTTPException(status_code=400, detail=f"Failed to fetch image: {str(e)}")
 
         if img:
             # Resize image if resolution exceeds 800x600

@@ -4,7 +4,7 @@ A high-performance, enterprise-ready FastAPI application for generating response
 
 ## Features
 
-- **Vision-Language Processing**: Generate responses based on text prompts and optional images (uploaded files or URLs).
+- **Vision-Language Processing**: Generate responses based on text prompts and optional uploaded images.
 - **Rate Limiting**: Prevents abuse with configurable per-IP and per-endpoint limits.
 - **Monitoring**: Integrated Prometheus metrics for request counts, latency, and error tracking.
 - **Health Checks**: Built-in `/health` endpoint for liveness probes.
@@ -30,7 +30,6 @@ A high-performance, enterprise-ready FastAPI application for generating response
    ```bash
    export MODEL_NAME="Qwen/Qwen2.5-VL-3B-Instruct"
    export MAX_IMAGE_SIZE="10485760"  # 10MB in bytes
-   export REQUEST_TIMEOUT="30"
    ```
 
 ## Usage
@@ -55,7 +54,6 @@ Generate a response based on text and optional image input.
 **Parameters:**
 - `text` (required): The text prompt.
 - `image` (optional): Uploaded image file (multipart/form-data).
-- `image_url` (optional): URL to an image.
 
 **Rate Limit:** 10 requests per minute.
 
@@ -64,6 +62,13 @@ Generate a response based on text and optional image input.
 curl -X POST "http://localhost:8000/generate" \
      -F "text=Describe this image" \
      -F "image=@example.jpg"
+```
+
+**Example with your image file:**
+```bash
+curl -X POST "http://localhost:8000/generate" \
+     -F "text=Describe this image in detail" \
+     -F "image=@/home/prasenjitjana/llm_model/image1.jpg"
 ```
 
 **Response:**
@@ -92,7 +97,6 @@ Configure the application using environment variables:
 
 - `MODEL_NAME`: Hugging Face model name (default: "Qwen/Qwen2.5-VL-3B-Instruct")
 - `MAX_IMAGE_SIZE`: Maximum image file size in bytes (default: 10MB)
-- `REQUEST_TIMEOUT`: Timeout for image downloads and processing in seconds (default: 30)
 
 ## Deployment
 
@@ -190,7 +194,7 @@ To run the application as a systemd service that auto-starts on system reboot, f
 
 - **Model Loading Issues**: Ensure sufficient GPU memory and correct model name. Check logs for CUDA errors.
 - **Rate Limiting**: Check logs for 429 responses. Adjust limits in `app.py` if needed.
-- **Image Processing Errors**: Verify image formats and sizes. Ensure PIL and requests are installed.
+- **Image Processing Errors**: Verify image formats and sizes. Ensure PIL is installed.
 - **Performance**: Monitor latency via `/metrics`. Scale resources or optimize model (e.g., quantization).
 - **Service Startup Failures**:
   - **Error 217/USER**: Invalid user in service file. Verify user exists (`id your-username`) and update `User=` in the service file.

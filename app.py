@@ -39,7 +39,7 @@ REQUEST_LATENCY = Histogram('request_latency_seconds', 'Request latency', ['meth
 # Load model and processor with error handling
 try:
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.float16, device_map="auto", load_in_8bit=True
+        MODEL_NAME, torch_dtype=torch.float16, device_map="auto"
     )
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
     logger.info("Model and processor loaded successfully")
@@ -105,9 +105,9 @@ async def generate_response(
                 raise HTTPException(status_code=400, detail="Invalid image URL")
 
         if img:
-            # Resize image if resolution exceeds 640x480
+            # Resize image if resolution exceeds 800x600
             width, height = img.size
-            if width * height > 640 * 480:
+            if width * height > 800 * 600:
                 logger.info(f"Resizing image from {img.size} to 384x384")
                 img = img.resize((384, 384), Image.Resampling.LANCZOS)
                 logger.info(f"Image resized to: {img.size}")
@@ -161,4 +161,4 @@ async def generate_response(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, workers=2)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

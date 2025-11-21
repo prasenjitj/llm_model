@@ -69,7 +69,33 @@ ENABLE_SERVER_IMAGE_DOWNLOAD = os.getenv("ENABLE_SERVER_IMAGE_DOWNLOAD", "true")
 ENABLE_SERVER_IMAGE_RESIZE = os.getenv("ENABLE_SERVER_IMAGE_RESIZE", "true").lower() in ("1", "true", "yes")
 DEBUG_IMAGE_FORM = os.getenv("DEBUG_IMAGE_FORM", "false").lower() in ("1", "true", "yes")
 
+# Mixed precision (FP16) toggle — only useful when a CUDA GPU is available
+USE_FP16 = os.getenv("USE_FP16", "false").lower() in ("1", "true", "yes")
+
 app = FastAPI(title="Qwen VL API", version="1.0.0")
+
+# Optional: prefer llmcompressor workflows for quantization/compatibility with AWQ exports
+USE_LLMCOMPRESSOR = os.getenv("USE_LLMCOMPRESSOR", "false").lower() in ("1", "true", "yes")
+
+# Try to import llmcompressor if requested. We do not call llmcompressor APIs
+# here — quantization is typically done offline — but we provide diagnostics
+# and a clear error message if the user requested it but it's not available.
+try:
+    import llmcompressor  # type: ignore
+    HAS_LLMCOMPRESSOR = True
+    logger.info("llmcompressor available")
+except Exception:
+    HAS_LLMCOMPRESSOR = False
+    if USE_LLMCOMPRESSOR:
+        logger.warning("USE_LLMCOMPRESSOR requested but 'llmcompressor' is not importable. Install via `pip install llmcompressor`.")
+
+# If the model name suggests it's an AWQ-quantized artifact, disable FP16
+# because mixing AMP/float16 with some AWQ/quantized formats can produce
+# NaNs and CUBLAS failures. This automatic fallback reduces surprising OOMs/errs.
+if 'awq' in MODEL_NAME.lower():
+    if USE_FP16:
+        logger.warning("MODEL_NAME contains 'awq' — disabling USE_FP16 to avoid FP16/quantized incompatibilities")
+    USE_FP16 = False
 
 # Request serial generator (simple incremental counter)
 _request_serial_counter = count(1)
@@ -198,8 +224,21 @@ async def inference_worker(worker_id: int):
 
 
             if batched_inputs is not None:
-                # Move to device
-                batched_inputs = {k: (v.to(model.device) if isinstance(v, torch.Tensor) else v) for k, v in batched_inputs.items()}
+                # Move to device and match model dtype for floating tensors to avoid
+                # fp16/fp32 mismatches in low-level kernels (e.g. Triton/CuBLAS).
+                def _move_tensor(t: torch.Tensor):
+                    if not isinstance(t, torch.Tensor):
+                        return t
+                    # keep integer types (input_ids, attention_mask) as their original dtype
+                    if torch.is_floating_point(t):
+                        try:
+                            return t.to(device=model.device, dtype=model.dtype)
+                        except Exception:
+                            return t.to(device=model.device)
+                    else:
+                        return t.to(device=model.device)
+
+                batched_inputs = {k: (_move_tensor(v) if isinstance(v, torch.Tensor) else v) for k, v in batched_inputs.items()}
 
                 # run generation in executor to keep event loop responsive
                 def blocking_generate(local_inputs):
@@ -264,8 +303,19 @@ async def inference_worker(worker_id: int):
                 outputs = []
                 for idx, (inp, fut, ser) in enumerate(zip(inputs_list, futures, serials)):
                     try:
-                        # move to device for this single input
-                        local_inputs = {k: (v.to(model.device) if isinstance(v, torch.Tensor) else v) for k, v in inp.items()}
+                        # move to device for this single input and match model dtype for floats
+                        def _move_local(t: torch.Tensor):
+                            if not isinstance(t, torch.Tensor):
+                                return t
+                            if torch.is_floating_point(t):
+                                try:
+                                    return t.to(device=model.device, dtype=model.dtype)
+                                except Exception:
+                                    return t.to(device=model.device)
+                            else:
+                                return t.to(device=model.device)
+
+                        local_inputs = {k: (_move_local(v) if isinstance(v, torch.Tensor) else v) for k, v in inp.items()}
 
                         def blocking_generate_single(local_inputs):
                             with torch.no_grad():
@@ -339,11 +389,25 @@ async def stop_inference_workers():
 
 # Load model and processor with error handling
 try:
+    # If the user requested llmcompressor workflows but the package is not
+    # available, fail early with a clear message so the operator can pip install it.
+    if USE_LLMCOMPRESSOR and not HAS_LLMCOMPRESSOR:
+        raise RuntimeError("Environment requests USE_LLMCOMPRESSOR but package 'llmcompressor' is not installed. Install with: pip install llmcompressor")
+
+    # Choose dtype dynamically: prefer float16 when requested and CUDA is available.
+    torch_dtype = torch.float16 if (USE_FP16 and torch.cuda.is_available()) else torch.float32
+
+    # Note: llmcompressor workflows typically quantize models offline and then
+    # the quantized model is loaded via vLLM or a compatible loader. Here we
+    # keep the standard HF load path; if you have a quantized model saved to
+    # disk (via llmcompressor), set MODEL_NAME to that path and the loader
+    # will attempt to load it. For advanced llmcompressor runtime loading,
+    # implement a dedicated loader following llmcompressor docs.
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.float16, device_map="auto"
+        MODEL_NAME, torch_dtype=torch_dtype, device_map="auto"
     )
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    logger.info("Model and processor loaded successfully")
+    logger.info(f"Model and processor loaded successfully (USE_FP16={USE_FP16}, dtype={torch_dtype}, USE_LLMCOMPRESSOR={USE_LLMCOMPRESSOR})")
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
     raise

@@ -9,3 +9,5 @@ requests
 slowapi
 prometheus-client
 colorama
+httpx
+python-dotenv

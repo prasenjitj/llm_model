@@ -68,3 +68,6 @@ docker-compose.override.yml
 
 # Systemd service file if kept in repo accidentally
 *.service
+# Images
+*.png
+*.jpg

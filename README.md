@@ -97,6 +97,16 @@ Configure the application using environment variables:
 
 - `MODEL_NAME`: Hugging Face model name (default: "Qwen/Qwen2.5-VL-3B-Instruct")
 - `MAX_IMAGE_SIZE`: Maximum image file size in bytes (default: 10MB)
+- `MAX_CONCURRENT_GENERATIONS`: Limits simultaneous `model.generate()` calls to avoid GPU OOM (default: 2). Tune this based on `nvidia-smi` and latency.
+- `MAX_CONCURRENT_GENERATIONS`: Number of worker threads that perform the heavy `model.generate()` calls (default: 2). This is the number of parallel inferences the model will run.
+- `MAX_INFERENCE_QUEUE_SIZE`: Size of the bounded inference queue that holds pending requests waiting for the worker pool. When this queue is full additional requests receive a `429 Too Many Requests` response (default: 32).
+- `MAX_INFERENCE_BATCH_SIZE`: Maximum number of in-flight requests the worker will batch together for a single model.generate() call (default: 4).
+- `BATCH_WAIT_TIMEOUT`: Time in seconds the worker will wait for more requests to accumulate before running a smaller batch (default: 0.02s).
+
+When the queue is full the server returns `429 Too Many Requests` and includes a `Retry-After` response header estimating seconds the client should wait, calculated from recent generation timings and current queue depth.
+- `ENABLE_SERVER_IMAGE_DOWNLOAD`: If set to `true`, the server may fetch an image from a URL provided in the `image_url` form field. Default is `false` to encourage client-side image upload and prevent server-side requests.
+- `ENABLE_SERVER_IMAGE_RESIZE`: If set to `true`, the server will automatically resize large images (over 800x600) to a smaller size before sending to the model. Default is `false` because image resizing is often handled on the client for better UX and lower server CPU usage.
+- `DEBUG_IMAGE_FORM`: If set to `true`, the server will emit extra debug logs that show `Content-Type`, form keys, and raw `image_url` when `image` and `image_url` are absent — useful to diagnose why `image_url` is None for incoming requests.
 
 ## Deployment
 
@@ -196,6 +206,7 @@ To run the application as a systemd service that auto-starts on system reboot, f
 - **Rate Limiting**: Check logs for 429 responses. Adjust limits in `app.py` if needed.
 - **Image Processing Errors**: Verify image formats and sizes. Ensure PIL is installed.
 - **Performance**: Monitor latency via `/metrics`. Scale resources or optimize model (e.g., quantization).
+   - **Concurrency Tuning**: Use the `MAX_CONCURRENT_GENERATIONS` environment variable to set how many concurrent generations are allowed on a single server. Start with `1-2` and increase until latency or GPU memory issues appear. Use the `load_test.py` script to emulate traffic.
 - **Service Startup Failures**:
   - **Error 217/USER**: Invalid user in service file. Verify user exists (`id your-username`) and update `User=` in the service file.
   - **Permission Issues**: Ensure the user owns the project directory (`sudo chown -R your-username:your-username /path/to/project`).
@@ -205,4 +216,17 @@ To run the application as a systemd service that auto-starts on system reboot, f
 
 ## License
 
-[Add your license here]
+This project is released under the MIT License — see the `LICENSE` file for details.
+
+Copyright (c) 2025 prasenjitj
+
+## Load Testing
+
+Use the included `load_test.py` script to simulate concurrent users and measure average latency and success rate.
+
+Example:
+```bash
+python load_test.py --url http://localhost:8000/generate --concurrency 2 --requests 10 --text "Hello"
+```
+
+This script depends on `httpx` (added to `requirements.txt`).

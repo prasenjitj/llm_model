@@ -159,14 +159,12 @@ To run the application as a systemd service that auto-starts on system reboot, f
 
    [Service]
    Type=simple
-   User=your-username  # Replace with your username (e.g., prasenjitjana)
-   WorkingDirectory=/home/your-username/llm_model  # Full path to project
-   ExecStart=/bin/bash -c 'source /home/your-username/llm_model/venv/bin/activate && python3 /home/your-username/llm_model/app.py'
+   User=prasenjitjana  # Replace with your username
+   WorkingDirectory=/home/prasenjitjana/llm_model
+   Environment=PATH=/home/prasenjitjana/llm_model/venv/bin
+   ExecStart=home/prasenjitjana/llm_model/venv/bin/python app.py
    Restart=always
    RestartSec=5
-   Environment=PATH=/home/your-username/llm_model/venv/bin
-   StandardOutput=journal
-   StandardError=journal
 
    [Install]
    WantedBy=multi-user.target

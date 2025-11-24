@@ -14,4 +14,3 @@ python-dotenv
 llmcompressor
 torchvision
 typing_extensions>=4.8.0
-autoawq>=0.1.8

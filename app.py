@@ -70,7 +70,34 @@ ENABLE_SERVER_IMAGE_RESIZE = os.getenv("ENABLE_SERVER_IMAGE_RESIZE", "true").low
 DEBUG_IMAGE_FORM = os.getenv("DEBUG_IMAGE_FORM", "false").lower() in ("1", "true", "yes")
 
 # Mixed precision (FP16) toggle — only useful when a CUDA GPU is available
-USE_FP16 = os.getenv("USE_FP16", "false").lower() in ("1", "true", "yes")
+USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("1", "true", "yes")
+
+# Enable TF32 for A100 - significant speedup for matmuls
+ENABLE_TF32 = os.getenv("ENABLE_TF32", "true").lower() in ("1", "true", "yes")
+
+# Flash Attention 2 support (if available)
+USE_FLASH_ATTENTION = os.getenv("USE_FLASH_ATTENTION", "true").lower() in ("1", "true", "yes")
+
+# BetterTransformer optimization
+USE_BETTERTRANSFORMER = os.getenv("USE_BETTERTRANSFORMER", "false").lower() in ("1", "true", "yes")
+
+# torch.compile for additional speedup (PyTorch 2.0+)
+COMPILE_MODEL = os.getenv("COMPILE_MODEL", "false").lower() in ("1", "true", "yes")
+
+# Max new tokens for generation
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
+
+# CUDA optimizations for A100
+if torch.cuda.is_available():
+    # Enable TF32 for faster matrix multiplications on A100
+    if ENABLE_TF32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("TF32 enabled for A100 acceleration")
+    
+    # Enable cudnn benchmark for consistent input sizes
+    torch.backends.cudnn.benchmark = True
+    logger.info("cuDNN benchmark mode enabled")
 
 app = FastAPI(title="Qwen VL API", version="1.0.0")
 
@@ -100,16 +127,67 @@ if 'awq' in MODEL_NAME.lower():
 # Request serial generator (simple incremental counter)
 _request_serial_counter = count(1)
 
-# Rate limiting setup
-limiter = Limiter(key_func=get_remote_address, default_limits=["100 per minute"])
+# Rate limiting setup - high throughput for A100
+limiter = Limiter(key_func=get_remote_address, default_limits=["1000 per minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-# Prometheus metrics
-REQUEST_COUNT = Counter('request_count', 'Total requests', ['method', 'endpoint', 'status'])
-REQUEST_LATENCY = Histogram('request_latency_seconds', 'Request latency', ['method', 'endpoint'])
-INFERENCE_QUEUE_GAUGE = Gauge('inference_queue_size', 'Number of queued inference requests')
+# Prometheus metrics - use get_or_create pattern to avoid duplicate registration
+from prometheus_client import REGISTRY
+
+def get_or_create_counter(name, description, labelnames):
+    try:
+        return Counter(name, description, labelnames)
+    except ValueError:
+        # Already registered, get existing
+        return REGISTRY._names_to_collectors.get(name + '_total') or REGISTRY._names_to_collectors.get(name)
+
+def get_or_create_histogram(name, description, labelnames=None, buckets=None):
+    try:
+        kwargs = {}
+        if labelnames:
+            kwargs['labelnames'] = labelnames
+        if buckets:
+            kwargs['buckets'] = buckets
+        return Histogram(name, description, **kwargs)
+    except ValueError:
+        return REGISTRY._names_to_collectors.get(name)
+
+def get_or_create_gauge(name, description):
+    try:
+        return Gauge(name, description)
+    except ValueError:
+        return REGISTRY._names_to_collectors.get(name)
+
+REQUEST_COUNT = get_or_create_counter('request_count', 'Total requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = get_or_create_histogram('request_latency_seconds', 'Request latency', ['method', 'endpoint'],
+                            buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0])
+INFERENCE_QUEUE_GAUGE = get_or_create_gauge('inference_queue_size', 'Number of queued inference requests')
+GPU_MEMORY_GAUGE = get_or_create_gauge('gpu_memory_used_bytes', 'GPU memory used in bytes')
+BATCH_SIZE_HISTOGRAM = get_or_create_histogram('batch_size', 'Actual batch sizes processed', buckets=[1, 2, 4, 8, 16])
+
+
+def update_gpu_metrics():
+    """Update GPU memory usage metric."""
+    if torch.cuda.is_available():
+        try:
+            memory_used = torch.cuda.memory_allocated()
+            GPU_MEMORY_GAUGE.set(memory_used)
+        except Exception:
+            pass
+
+
+# Concurrency settings - must be defined before inference_worker
+MAX_CONCURRENT_GENERATIONS = int(os.getenv("MAX_CONCURRENT_GENERATIONS", "16"))
+MAX_INFERENCE_QUEUE_SIZE = int(os.getenv("MAX_INFERENCE_QUEUE_SIZE", "500"))
+# Note: inference_queue will be initialized in startup event (asyncio.Queue needs running loop)
+inference_queue: asyncio.Queue = None  # type: ignore
+INFERENCE_WORKERS: list = []
+MAX_INFERENCE_BATCH_SIZE = int(os.getenv("MAX_INFERENCE_BATCH_SIZE", "16"))
+BATCH_WAIT_TIMEOUT = float(os.getenv("BATCH_WAIT_TIMEOUT", "0.03"))
+GEN_TIME_HISTORY = deque(maxlen=1000)
+GEN_TIME_DEFAULT_EST = float(os.getenv("GEN_TIME_DEFAULT_EST", "3.0"))
 
 
 async def inference_worker(worker_id: int):
@@ -135,6 +213,7 @@ async def inference_worker(worker_id: int):
 
         # At this point 'batch' contains 1..MAX_INFERENCE_BATCH_SIZE items
         INFERENCE_QUEUE_GAUGE.set(inference_queue.qsize())
+        BATCH_SIZE_HISTOGRAM.observe(len(batch))
         serials = [it[0] for it in batch]
         inputs_list = [it[1] for it in batch]
         futures = [it[2] for it in batch]
@@ -232,24 +311,25 @@ async def inference_worker(worker_id: int):
                     # keep integer types (input_ids, attention_mask) as their original dtype
                     if torch.is_floating_point(t):
                         try:
-                            return t.to(device=model.device, dtype=model.dtype)
+                            return t.to(device=model.device, dtype=model.dtype, non_blocking=True)
                         except Exception:
-                            return t.to(device=model.device)
+                            return t.to(device=model.device, non_blocking=True)
                     else:
-                        return t.to(device=model.device)
+                        return t.to(device=model.device, non_blocking=True)
 
                 batched_inputs = {k: (_move_tensor(v) if isinstance(v, torch.Tensor) else v) for k, v in batched_inputs.items()}
 
                 # run generation in executor to keep event loop responsive
                 def blocking_generate(local_inputs):
-                    with torch.no_grad():
-                        ids = model.generate(**local_inputs, max_new_tokens=128)
+                    with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_FP16):
+                        ids = model.generate(**local_inputs, max_new_tokens=MAX_NEW_TOKENS, use_cache=True)
                     return ids
 
                 gen_start = time.perf_counter()
                 try:
                     generated = await loop.run_in_executor(None, blocking_generate, batched_inputs)
                     gen_elapsed = time.perf_counter() - gen_start
+                    update_gpu_metrics()
                 except Exception as e:
                     # If batched generation fails due to unexpected internal tensor ops
                     # (e.g., expand_as on incompatible shapes), log details and fall
@@ -309,17 +389,17 @@ async def inference_worker(worker_id: int):
                                 return t
                             if torch.is_floating_point(t):
                                 try:
-                                    return t.to(device=model.device, dtype=model.dtype)
+                                    return t.to(device=model.device, dtype=model.dtype, non_blocking=True)
                                 except Exception:
-                                    return t.to(device=model.device)
+                                    return t.to(device=model.device, non_blocking=True)
                             else:
-                                return t.to(device=model.device)
+                                return t.to(device=model.device, non_blocking=True)
 
                         local_inputs = {k: (_move_local(v) if isinstance(v, torch.Tensor) else v) for k, v in inp.items()}
 
                         def blocking_generate_single(local_inputs):
-                            with torch.no_grad():
-                                return model.generate(**local_inputs, max_new_tokens=128)
+                            with torch.no_grad(), torch.cuda.amp.autocast(enabled=USE_FP16):
+                                return model.generate(**local_inputs, max_new_tokens=MAX_NEW_TOKENS, use_cache=True)
 
                         single_start = time.perf_counter()
                         gen_single = await loop.run_in_executor(None, blocking_generate_single, local_inputs)
@@ -373,6 +453,11 @@ async def inference_worker(worker_id: int):
 
 @app.on_event("startup")
 async def start_inference_workers():
+    global inference_queue, INFERENCE_WORKERS
+    # Initialize the queue in async context
+    inference_queue = asyncio.Queue(maxsize=MAX_INFERENCE_QUEUE_SIZE)
+    # Clear workers list in case of reload
+    INFERENCE_WORKERS = []
     logger.info(f"Starting {MAX_CONCURRENT_GENERATIONS} inference worker(s)")
     for i in range(MAX_CONCURRENT_GENERATIONS):
         task = asyncio.create_task(inference_worker(i))
@@ -387,7 +472,7 @@ async def stop_inference_workers():
     # allow in-flight tasks to finish
     await asyncio.gather(*INFERENCE_WORKERS, return_exceptions=True)
 
-# Load model and processor with error handling
+# Load model and processor with A100 optimizations
 try:
     # If the user requested llmcompressor workflows but the package is not
     # available, fail early with a clear message so the operator can pip install it.
@@ -397,43 +482,99 @@ try:
     # Choose dtype dynamically: prefer float16 when requested and CUDA is available.
     torch_dtype = torch.float16 if (USE_FP16 and torch.cuda.is_available()) else torch.float32
 
-    # Note: llmcompressor workflows typically quantize models offline and then
-    # the quantized model is loaded via vLLM or a compatible loader. Here we
-    # keep the standard HF load path; if you have a quantized model saved to
-    # disk (via llmcompressor), set MODEL_NAME to that path and the loader
-    # will attempt to load it. For advanced llmcompressor runtime loading,
-    # implement a dedicated loader following llmcompressor docs.
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_NAME, torch_dtype=torch_dtype, device_map="auto"
-    )
+    # Model loading with attention optimization
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "device_map": "auto",
+    }
+    
+    # Try different attention implementations in order of preference
+    attn_impl_used = "default"
+    if USE_FLASH_ATTENTION:
+        try:
+            # First try Flash Attention 2
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("Attempting Flash Attention 2...")
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+            attn_impl_used = "flash_attention_2"
+            logger.info("Flash Attention 2 loaded successfully")
+        except Exception as e:
+            logger.warning(f"Flash Attention 2 failed: {e}")
+            # Fall back to SDPA (Scaled Dot Product Attention) - PyTorch native, very fast
+            try:
+                model_kwargs["attn_implementation"] = "sdpa"
+                logger.info("Falling back to SDPA attention...")
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+                attn_impl_used = "sdpa"
+                logger.info("SDPA attention loaded successfully")
+            except Exception as e2:
+                logger.warning(f"SDPA failed: {e2}, using default attention")
+                del model_kwargs["attn_implementation"]
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+                attn_impl_used = "eager"
+    else:
+        # Use SDPA by default (fast and stable)
+        try:
+            model_kwargs["attn_implementation"] = "sdpa"
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+            attn_impl_used = "sdpa"
+        except Exception:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+            attn_impl_used = "eager"
+    
+    # Optional: Apply BetterTransformer for inference optimization
+    if USE_BETTERTRANSFORMER:
+        try:
+            model = model.to_bettertransformer()
+            logger.info("BetterTransformer optimization applied")
+        except Exception as e:
+            logger.warning(f"BetterTransformer not available: {e}")
+    
+    # Compile model with torch.compile for additional speedup (PyTorch 2.0+)
+    if COMPILE_MODEL and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("Model compiled with torch.compile()")
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}")
+    
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    logger.info(f"Model and processor loaded successfully (USE_FP16={USE_FP16}, dtype={torch_dtype}, USE_LLMCOMPRESSOR={USE_LLMCOMPRESSOR})")
+    
+    # Log GPU info
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logger.info(f"GPU: {gpu_name}, Memory: {gpu_memory:.1f} GB")
+    
+    logger.info(f"Model loaded (USE_FP16={USE_FP16}, dtype={torch_dtype}, attn={attn_impl_used})")
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
     raise
 
-# Concurrency limiter for generation calls (prevents GPU overload)
-MAX_CONCURRENT_GENERATIONS = int(os.getenv("MAX_CONCURRENT_GENERATIONS", "4"))
-# We'll use a bounded inference queue and a worker-pool of size MAX_CONCURRENT_GENERATIONS.
-# When the queue is full, the endpoint will return 429 (Too Many Requests) as backpressure.
-MAX_INFERENCE_QUEUE_SIZE = int(os.getenv("MAX_INFERENCE_QUEUE_SIZE", "100"))
-inference_queue = asyncio.Queue(maxsize=MAX_INFERENCE_QUEUE_SIZE)
-INFERENCE_WORKERS = []
-MAX_INFERENCE_BATCH_SIZE = int(os.getenv("MAX_INFERENCE_BATCH_SIZE", "1"))
-# time in seconds to wait for additional requests to arrive so we can form a batch
-BATCH_WAIT_TIMEOUT = float(os.getenv("BATCH_WAIT_TIMEOUT", "0.1"))
-# keep a short history of generation durations to estimate wait time (seconds)
-GEN_TIME_HISTORY = deque(maxlen=200)
-GEN_TIME_DEFAULT_EST = float(os.getenv("GEN_TIME_DEFAULT_EST", "10.0"))
 
-# Health check endpoint
+# Health check endpoint with GPU info
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    gpu_info = {}
+    if torch.cuda.is_available():
+        gpu_info = {
+            "gpu_name": torch.cuda.get_device_name(0),
+            "gpu_memory_allocated_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),
+            "gpu_memory_reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),
+        }
+    queue_size = inference_queue.qsize() if inference_queue else 0
+    return {
+        "status": "healthy",
+        "queue_size": queue_size,
+        "workers": MAX_CONCURRENT_GENERATIONS,
+        "batch_size": MAX_INFERENCE_BATCH_SIZE,
+        **gpu_info
+    }
 
 # Metrics endpoint
 @app.get("/metrics")
 async def metrics():
+    update_gpu_metrics()
     return generate_latest()
 
 @app.post("/generate")
@@ -548,6 +689,8 @@ async def generate_response(
 
         # Generate response — enqueue for worker pool. If the queue is full, return 429.
         logger.info("Enqueuing request for generation")
+        if inference_queue is None:
+            raise HTTPException(status_code=503, detail="Server not ready - queue not initialized")
         req_future = asyncio.get_running_loop().create_future()
         try:
             inference_queue.put_nowait((req_serial, inputs, req_future))
@@ -599,4 +742,9 @@ async def generate_response(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use the app object directly to avoid re-importing the module
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+    )

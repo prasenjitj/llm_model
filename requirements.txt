@@ -14,3 +14,7 @@ python-dotenv
 llmcompressor
 torchvision
 typing_extensions>=4.8.0
+# A100 performance optimizations
+uvloop
+httptools
+flash-attn

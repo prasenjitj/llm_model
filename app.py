@@ -1,4 +1,5 @@
 import logging
+import argparse
 # load .env file into the environment by default for local / dev usage
 try:
     from dotenv import load_dotenv
@@ -128,7 +129,7 @@ if 'awq' in MODEL_NAME.lower():
 _request_serial_counter = count(1)
 
 # Rate limiting setup - high throughput for A100
-limiter = Limiter(key_func=get_remote_address, default_limits=["1000 per minute"])
+limiter = Limiter(key_func=get_remote_address, default_limits=["3000 per minute"])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
@@ -645,15 +646,17 @@ async def generate_response(
                 raise HTTPException(status_code=400, detail=f"Failed to fetch image: {str(e)}")
 
         if img:
-            # Optionally resize image server-side if resolution exceeds 800x600
+            # Always resize images to consistent size for batching compatibility
+            # Variable image sizes cause tensor shape mismatches that disable batching
+            TARGET_SIZE = (512, 512)
             width, height = img.size
-            if ENABLE_SERVER_IMAGE_RESIZE and width * height > 800 * 600:
-                logger.info(f"Resizing image from {img.size} to 512x512")
-                img = img.resize((512, 512), Image.Resampling.LANCZOS)
-                logger.info(f"Image resized to: {img.size}")
+            if ENABLE_SERVER_IMAGE_RESIZE:
+                if (width, height) != TARGET_SIZE:
+                    logger.info(f"Resizing image from {img.size} to {TARGET_SIZE} for batching compatibility")
+                    img = img.resize(TARGET_SIZE, Image.Resampling.LANCZOS)
+                    logger.info(f"Image resized to: {img.size}")
             else:
-                if not ENABLE_SERVER_IMAGE_RESIZE:
-                    logger.info("Server-side image resize disabled; using client-provided image size")
+                logger.info("Server-side image resize disabled; using client-provided image size (may affect batching)")
 
             messages[0]["content"].append({"type": "image", "image": img})
         else:
@@ -743,10 +746,16 @@ async def generate_response(
 if __name__ == "__main__":
     import uvicorn
     # Use the app object directly to avoid re-importing the module
-    port = int(os.getenv("PORT", "8000"))
-    logger.info(f"Starting server on port {port}")
+    parser = argparse.ArgumentParser(description="Qwen VL API Server")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port to bind to")
+    parser.add_argument("--workers", type=int, default=1, help="Number of uvicorn workers")
+    args = parser.parse_args()
+    
+    logger.info(f"Starting server on {args.host}:{args.port}")
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=port,
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
     )

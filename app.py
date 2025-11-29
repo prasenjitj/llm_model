@@ -16,7 +16,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, Gauge
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoConfig
 import torch
 from PIL import Image
 import io
@@ -523,12 +523,25 @@ try:
         raise RuntimeError("Environment requests USE_LLMCOMPRESSOR but package 'llmcompressor' is not installed. Install with: pip install llmcompressor")
 
     # Choose dtype dynamically: prefer float16 when requested and CUDA is available.
-    torch_dtype = torch.float16 if (USE_FP16 and torch.cuda.is_available()) else torch.float32
+    model_dtype = torch.float16 if (USE_FP16 and torch.cuda.is_available()) else torch.float32
+
+    # Auto-detect model architecture from config
+    config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model_type = getattr(config, 'model_type', '').lower()
+    
+    # Select the correct model class based on architecture
+    if 'qwen2_5_vl' in model_type or 'qwen2.5' in MODEL_NAME.lower():
+        ModelClass = Qwen2_5_VLForConditionalGeneration
+        logger.info(f"Detected Qwen2.5-VL architecture for {MODEL_NAME}")
+    else:
+        ModelClass = Qwen2VLForConditionalGeneration
+        logger.info(f"Detected Qwen2-VL architecture for {MODEL_NAME}")
 
     # Model loading with attention optimization
     model_kwargs = {
-        "torch_dtype": torch_dtype,
+        "dtype": model_dtype,  # Use 'dtype' instead of deprecated 'torch_dtype'
         "device_map": "auto",
+        "trust_remote_code": True,
     }
     
     # Try different attention implementations in order of preference
@@ -538,7 +551,7 @@ try:
             # First try Flash Attention 2
             model_kwargs["attn_implementation"] = "flash_attention_2"
             logger.info("Attempting Flash Attention 2...")
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+            model = ModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
             attn_impl_used = "flash_attention_2"
             logger.info("Flash Attention 2 loaded successfully")
         except Exception as e:
@@ -547,22 +560,23 @@ try:
             try:
                 model_kwargs["attn_implementation"] = "sdpa"
                 logger.info("Falling back to SDPA attention...")
-                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+                model = ModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
                 attn_impl_used = "sdpa"
                 logger.info("SDPA attention loaded successfully")
             except Exception as e2:
                 logger.warning(f"SDPA failed: {e2}, using default attention")
                 del model_kwargs["attn_implementation"]
-                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+                model = ModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
                 attn_impl_used = "eager"
     else:
         # Use SDPA by default (fast and stable)
         try:
             model_kwargs["attn_implementation"] = "sdpa"
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+            model = ModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
             attn_impl_used = "sdpa"
         except Exception:
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL_NAME, **model_kwargs)
+            del model_kwargs["attn_implementation"]
+            model = ModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
             attn_impl_used = "eager"
     
     # Optional: Apply BetterTransformer for inference optimization
@@ -589,7 +603,7 @@ try:
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         logger.info(f"GPU: {gpu_name}, Memory: {gpu_memory:.1f} GB")
     
-    logger.info(f"Model loaded (USE_FP16={USE_FP16}, dtype={torch_dtype}, attn={attn_impl_used})")
+    logger.info(f"Model loaded (USE_FP16={USE_FP16}, dtype={model_dtype}, attn={attn_impl_used}, model_class={ModelClass.__name__})")
 except Exception as e:
     logger.error(f"Failed to load model: {e}")
     raise

@@ -88,6 +88,48 @@ COMPILE_MODEL = os.getenv("COMPILE_MODEL", "false").lower() in ("1", "true", "ye
 # Max new tokens for generation
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 
+# Memory management settings
+CLEAR_CACHE_EVERY_N_REQUESTS = int(os.getenv("CLEAR_CACHE_EVERY_N_REQUESTS", "50"))
+ENABLE_MEMORY_DEFRAG = os.getenv("ENABLE_MEMORY_DEFRAG", "true").lower() in ("1", "true", "yes")
+
+# Track requests for periodic cache clearing
+_requests_since_cache_clear = 0
+_cache_clear_lock = None  # Will be initialized in startup
+
+
+def clear_gpu_memory(force: bool = False):
+    """Clear GPU memory caches to prevent fragmentation and KV cache growth."""
+    global _requests_since_cache_clear
+    
+    if not torch.cuda.is_available():
+        return
+    
+    _requests_since_cache_clear += 1
+    
+    # Periodic cache clearing
+    should_clear = force or (_requests_since_cache_clear >= CLEAR_CACHE_EVERY_N_REQUESTS)
+    
+    if should_clear:
+        try:
+            # Clear PyTorch CUDA cache
+            torch.cuda.empty_cache()
+            
+            # Synchronize to ensure all operations are complete
+            torch.cuda.synchronize()
+            
+            if ENABLE_MEMORY_DEFRAG:
+                # Force garbage collection to release Python-side references
+                import gc
+                gc.collect()
+                
+                # Clear cache again after GC
+                torch.cuda.empty_cache()
+            
+            _requests_since_cache_clear = 0
+            logger.debug(f"GPU memory cleared (defrag={ENABLE_MEMORY_DEFRAG})")
+        except Exception as e:
+            logger.warning(f"Failed to clear GPU memory: {e}")
+
 # CUDA optimizations for A100
 if torch.cuda.is_available():
     # Enable TF32 for faster matrix multiplications on A100
@@ -441,8 +483,8 @@ async def inference_worker(worker_id: int):
                     except Exception as e2:
                         logger.warning(f"Failed to set_exception for future serial={ser}: {e2}")
         finally:
-            # free device memory between batches
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            # Clear GPU memory periodically to prevent KV cache growth and fragmentation
+            clear_gpu_memory(force=False)
             # mark every item in the batch as done
             for _ in batch:
                 try:
@@ -558,10 +600,16 @@ except Exception as e:
 async def health_check():
     gpu_info = {}
     if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        total = torch.cuda.get_device_properties(0).total_memory
         gpu_info = {
             "gpu_name": torch.cuda.get_device_name(0),
-            "gpu_memory_allocated_gb": round(torch.cuda.memory_allocated() / (1024**3), 2),
-            "gpu_memory_reserved_gb": round(torch.cuda.memory_reserved() / (1024**3), 2),
+            "gpu_memory_allocated_gb": round(allocated / (1024**3), 2),
+            "gpu_memory_reserved_gb": round(reserved / (1024**3), 2),
+            "gpu_memory_total_gb": round(total / (1024**3), 2),
+            "gpu_memory_free_gb": round((total - reserved) / (1024**3), 2),
+            "gpu_utilization_pct": round((reserved / total) * 100, 1),
         }
     queue_size = inference_queue.qsize() if inference_queue else 0
     return {
@@ -569,7 +617,37 @@ async def health_check():
         "queue_size": queue_size,
         "workers": MAX_CONCURRENT_GENERATIONS,
         "batch_size": MAX_INFERENCE_BATCH_SIZE,
+        "requests_since_cache_clear": _requests_since_cache_clear,
+        "cache_clear_interval": CLEAR_CACHE_EVERY_N_REQUESTS,
         **gpu_info
+    }
+
+
+# Force memory clear endpoint (for maintenance)
+@app.post("/clear_memory")
+async def clear_memory_endpoint():
+    """Force clear GPU memory - use for maintenance or when memory is fragmented."""
+    if not torch.cuda.is_available():
+        return {"status": "no_gpu", "message": "No GPU available"}
+    
+    before_allocated = torch.cuda.memory_allocated()
+    before_reserved = torch.cuda.memory_reserved()
+    
+    # Force clear
+    clear_gpu_memory(force=True)
+    
+    after_allocated = torch.cuda.memory_allocated()
+    after_reserved = torch.cuda.memory_reserved()
+    
+    freed_allocated = (before_allocated - after_allocated) / (1024**3)
+    freed_reserved = (before_reserved - after_reserved) / (1024**3)
+    
+    return {
+        "status": "success",
+        "freed_allocated_gb": round(freed_allocated, 3),
+        "freed_reserved_gb": round(freed_reserved, 3),
+        "current_allocated_gb": round(after_allocated / (1024**3), 2),
+        "current_reserved_gb": round(after_reserved / (1024**3), 2),
     }
 
 # Metrics endpoint
@@ -725,8 +803,7 @@ async def generate_response(
         # Extract only the assistant's response
         response = response.split("assistant\n")[-1].strip()
         logger.info(f"Final response: {response}")
-        # Clear cache after decoding to free VRAM
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        # Note: Memory clearing is handled by inference_worker after each batch
 
         REQUEST_COUNT.labels(method="POST", endpoint="/generate", status="success").inc()
         return {"response": response}
